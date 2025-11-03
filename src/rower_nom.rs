@@ -6,6 +6,7 @@ use nom::{
     number::complete::{le_i16, le_u16, u8 as parse_u8},
 };
 use nom_language::error::VerboseError;
+use std::fmt;
 
 pub type PResult<'a, T> = IResult<&'a [u8], T, VerboseError<&'a [u8]>>;
 
@@ -93,6 +94,76 @@ impl RowerRecord {
         self.metabolic_equiv_tenths
             .map(|tenths| tenths as f32 / 10.0)
     }
+}
+
+impl fmt::Display for RowerRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut parts = Vec::new();
+
+        if let Some(spm) = self.stroke_rate_spm() {
+            parts.push(format!("spm={:.1}", spm));
+        }
+        if let Some(strokes) = self.stroke_count {
+            parts.push(format!("strokes={}", strokes));
+        }
+        if let Some(distance) = self.total_distance_m {
+            parts.push(format!("distance={}m", distance));
+        }
+        if let Some(power) = self.inst_power_w {
+            parts.push(format!("power={}W", power));
+        }
+        if let Some(avg_power) = self.avg_power_w {
+            parts.push(format!("avg_power={}W", avg_power));
+        }
+        if let Some(res) = self.resistance_level {
+            parts.push(format!("res={}", res));
+        }
+        if let Some(hr) = self.heart_rate_bpm {
+            parts.push(format!("hr={}bpm", hr));
+        }
+        if let Some(pace) = self.inst_pace_s_per_500m {
+            parts.push(format!("pace={}/500m", format_pace(pace)));
+        }
+        if let Some(avg_pace) = self.avg_pace_s_per_500m {
+            parts.push(format!("avg_pace={}/500m", format_pace(avg_pace)));
+        }
+        if let Some(avg_spm) = self.avg_stroke_rate_spm() {
+            parts.push(format!("avg_spm={:.1}", avg_spm));
+        }
+        if let Some(met) = self.metabolic_equiv() {
+            parts.push(format!("met={:.1}", met));
+        }
+        if let Some(total_energy) = self.total_energy_kcal {
+            parts.push(format!("energy={}kcal", total_energy));
+        }
+        if let Some(en_hr) = self.energy_per_hour_kcal.filter(|v| *v != 0) {
+            parts.push(format!("energy_hr={}kcal", en_hr));
+        }
+        if let Some(en_min) = self.energy_per_minute_kcal.filter(|v| *v != 0) {
+            parts.push(format!("energy_min={}kcal", en_min));
+        }
+        if let Some(elapsed) = self.elapsed_time_s {
+            parts.push(format!("elapsed={}s", elapsed));
+        }
+        if let Some(remaining) = self.remaining_time_s {
+            parts.push(format!("remaining={}s", remaining));
+        }
+        if self.flags != 0 {
+            parts.push(format!("flags=0x{:04X}", self.flags));
+        }
+
+        if parts.is_empty() {
+            write!(f, "rower record (no fields)")
+        } else {
+            write!(f, "rower {}", parts.join(" "))
+        }
+    }
+}
+
+fn format_pace(seconds: u16) -> String {
+    let minutes = seconds / 60;
+    let secs = seconds % 60;
+    format!("{minutes}:{secs:02}")
 }
 
 #[derive(Default)]

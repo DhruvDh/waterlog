@@ -7,13 +7,13 @@ use bpaf::{OptionParser, Parser, construct, long, pure};
 use btleplug::{
     api::{
         Central, CharPropFlags, Characteristic, Manager as _, Peripheral as _, ScanFilter,
-        WriteType,
+        ValueNotification, WriteType,
     },
     platform::{Adapter, Manager, Peripheral},
 };
 use futures::StreamExt;
 use tokio::time;
-use tracing::Level;
+use tracing::{Level, debug, info, warn};
 use uuid::Uuid;
 
 const FTMS_SVC: Uuid = Uuid::from_u128(0x0000_1826_0000_1000_8000_0080_5F9B_34FB);
@@ -74,17 +74,18 @@ async fn list_gatt(adapter: &Adapter) -> Result<()> {
     let peripheral = connect_target(adapter).await?;
 
     if let Some(props) = peripheral.properties().await? {
-        println!("Connected to: {:?}", props);
+        info!(?props, "Connected to peripheral");
     } else {
-        println!("Connected, but peripheral properties were unavailable");
+        warn!("Connected, but peripheral properties were unavailable");
     }
 
     for ch in peripheral.characteristics() {
-        println!(
-            "- svc={} ch={} props=[{}]",
-            ch.service_uuid,
-            ch.uuid,
-            fmt_props(ch.properties)
+        let props = fmt_props(ch.properties);
+        info!(
+            service = %ch.service_uuid,
+            characteristic = %ch.uuid,
+            properties = %props,
+            "Characteristic discovered"
         );
     }
 
@@ -104,43 +105,52 @@ async fn stream_rower(adapter: &Adapter, handshake: bool) -> Result<()> {
         perform_handshake(&peripheral, &characteristics).await?;
     }
 
-    let ctrl_uuid = characteristics.ctrl_point.as_ref().map(|c| c.uuid);
-    let status_uuid = characteristics.status.as_ref().map(|c| c.uuid);
-
     let mut notifications = peripheral.notifications().await?;
     let mut assembler = rower_nom::RowerAssembler::default();
     let mut last_record: Option<rower_nom::RowerRecord> = None;
-    println!("Waiting for Rower Data notifications...");
+    info!("Waiting for Rower Data notifications...");
 
     while let Some(notification) = notifications.next().await {
-        if notification.uuid == characteristics.data.uuid {
-            match rower_nom::parse_rower_fragment(&notification.value) {
-                Ok((remaining, fragment)) => {
-                    let flags = fragment.flags;
-                    if !remaining.is_empty() {
-                        eprintln!(
-                            "Trailing bytes after FTMS parse (flags=0x{flags:04X}): {}",
-                            hex(remaining)
+        match classify_notification(&notification, &characteristics) {
+            NotificationKind::RowerData => {
+                match rower_nom::parse_rower_fragment(&notification.value) {
+                    Ok((remaining, fragment)) => {
+                        let flags = fragment.flags;
+                        if !remaining.is_empty() {
+                            warn!(
+                                flags = %format_args!("0x{flags:04X}"),
+                                trailing = %hex(remaining),
+                                "Trailing bytes after FTMS parse"
+                            );
+                        }
+                        if let Some(mut record) = assembler.push(fragment) {
+                            enhance_instant_pace(&mut record, last_record.as_ref());
+                            info!("{record}");
+                            last_record = Some(record);
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            error = ?err,
+                            raw = %hex(&notification.value),
+                            "Failed to parse FTMS rower data"
                         );
                     }
-                    if let Some(mut record) = assembler.push(fragment) {
-                        enhance_instant_pace(&mut record, last_record.as_ref());
-                        println!("{}", format_rower_record(&record));
-                        last_record = Some(record);
-                    }
-                }
-                Err(err) => {
-                    eprintln!(
-                        "Failed to parse FTMS rower data: {:?}; raw={}",
-                        err,
-                        hex(&notification.value)
-                    );
                 }
             }
-        } else if Some(notification.uuid) == ctrl_uuid {
-            println!("ctrl-point resp: {}", hex(&notification.value));
-        } else if Some(notification.uuid) == status_uuid {
-            println!("status: {}", hex(&notification.value));
+            NotificationKind::ControlPoint => {
+                info!(response = %hex(&notification.value), "Control Point response");
+            }
+            NotificationKind::Status => {
+                info!(payload = %hex(&notification.value), "Status notification");
+            }
+            NotificationKind::Other => {
+                debug!(
+                    uuid = %notification.uuid,
+                    payload = %hex(&notification.value),
+                    "Unhandled notification"
+                );
+            }
         }
     }
 
@@ -207,17 +217,28 @@ async fn pick_ftms_device(adapter: &Adapter) -> Result<Peripheral> {
     // Give the adapter a moment to populate devices.
     time::sleep(Duration::from_secs(3)).await;
 
+    let mut candidate = None;
     for peripheral in adapter.peripherals().await? {
         let Some(props) = peripheral.properties().await? else {
             continue;
         };
 
         if props.services.contains(&FTMS_SVC) {
-            return Ok(peripheral);
+            candidate = Some(peripheral);
+            break;
         }
     }
 
-    bail!("No FTMS-like device found (make sure the console is awake)");
+    adapter
+        .stop_scan()
+        .await
+        .context("Failed to stop BLE scan")?;
+
+    if let Some(peripheral) = candidate {
+        Ok(peripheral)
+    } else {
+        bail!("No FTMS-like device found (make sure the console is awake)");
+    }
 }
 
 async fn connect_and_discover(peripheral: &Peripheral) -> Result<()> {
@@ -279,13 +300,15 @@ async fn perform_handshake(peripheral: &Peripheral, chars: &RowerCharacteristics
             .write(ctrl, &[0x07], WriteType::WithResponse)
             .await
             .context("Control Point Start/Resume (0x07) failed")?;
-        println!("Sent FTMS Request Control + Start/Resume");
+        info!("Sent FTMS Request Control + Start/Resume");
     } else {
-        println!("Control Point (0x2AD9) missing; skipping handshake");
+        warn!("Control Point (0x2AD9) missing; skipping handshake");
     }
 
     if let Some(status) = &chars.status {
-        let _ = peripheral.subscribe(status).await;
+        if let Err(err) = peripheral.subscribe(status).await {
+            warn!(error = ?err, "Failed to subscribe to Rower Status indications");
+        }
     }
 
     Ok(())
@@ -325,70 +348,34 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-fn fmt_pace(seconds: u16) -> String {
-    let minutes = seconds / 60;
-    let secs = seconds % 60;
-    format!("{minutes}:{secs:02}")
+enum NotificationKind {
+    RowerData,
+    ControlPoint,
+    Status,
+    Other,
 }
 
-fn format_rower_record(record: &rower_nom::RowerRecord) -> String {
-    let mut parts = Vec::new();
-
-    if let Some(spm) = record.stroke_rate_spm() {
-        parts.push(format!("spm={:.1}", spm));
-    }
-    if let Some(strokes) = record.stroke_count {
-        parts.push(format!("strokes={}", strokes));
-    }
-    if let Some(distance) = record.total_distance_m {
-        parts.push(format!("distance={}m", distance));
-    }
-    if let Some(power) = record.inst_power_w {
-        parts.push(format!("power={}W", power));
-    }
-    if let Some(avg_power) = record.avg_power_w {
-        parts.push(format!("avg_power={}W", avg_power));
-    }
-    if let Some(res) = record.resistance_level {
-        parts.push(format!("res={}", res));
-    }
-    if let Some(hr) = record.heart_rate_bpm {
-        parts.push(format!("hr={}bpm", hr));
-    }
-    if let Some(pace) = record.inst_pace_s_per_500m {
-        parts.push(format!("pace={}/500m", fmt_pace(pace)));
-    }
-    if let Some(avg_pace) = record.avg_pace_s_per_500m {
-        parts.push(format!("avg_pace={}/500m", fmt_pace(avg_pace)));
-    }
-    if let Some(avg_spm) = record.avg_stroke_rate_spm() {
-        parts.push(format!("avg_spm={:.1}", avg_spm));
-    }
-    if let Some(met) = record.metabolic_equiv() {
-        parts.push(format!("met={:.1}", met));
-    }
-    if let Some(total_energy) = record.total_energy_kcal {
-        parts.push(format!("energy={}kcal", total_energy));
-    }
-    if let Some(en_hr) = record.energy_per_hour_kcal.filter(|v| *v != 0) {
-        parts.push(format!("energy_hr={}kcal", en_hr));
-    }
-    if let Some(en_min) = record.energy_per_minute_kcal.filter(|v| *v != 0) {
-        parts.push(format!("energy_min={}kcal", en_min));
-    }
-    if let Some(elapsed) = record.elapsed_time_s {
-        parts.push(format!("elapsed={}s", elapsed));
-    }
-    if let Some(remaining) = record.remaining_time_s {
-        parts.push(format!("remaining={}s", remaining));
-    }
-    if record.flags != 0 {
-        parts.push(format!("flags=0x{:04X}", record.flags));
-    }
-
-    if parts.is_empty() {
-        "rower record (no fields)".to_owned()
+fn classify_notification(
+    notification: &ValueNotification,
+    chars: &RowerCharacteristics,
+) -> NotificationKind {
+    if notification.uuid == chars.data.uuid {
+        NotificationKind::RowerData
+    } else if chars
+        .ctrl_point
+        .as_ref()
+        .map(|ch| ch.uuid == notification.uuid)
+        .unwrap_or(false)
+    {
+        NotificationKind::ControlPoint
+    } else if chars
+        .status
+        .as_ref()
+        .map(|ch| ch.uuid == notification.uuid)
+        .unwrap_or(false)
+    {
+        NotificationKind::Status
     } else {
-        format!("rower {}", parts.join(" "))
+        NotificationKind::Other
     }
 }
