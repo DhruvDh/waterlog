@@ -1,6 +1,6 @@
 use nom::{
     IResult, Parser,
-    bytes::complete::take,
+    bytes::complete::{take, take_while},
     combinator::cond,
     error::context,
     number::complete::{le_i16, le_u16, u8 as parse_u8},
@@ -107,7 +107,10 @@ impl RowerAssembler {
             None
         } else {
             let record = std::mem::take(&mut self.current);
-            Some(record)
+            Some(RowerRecord {
+                flags: record.flags & !1,
+                ..record
+            })
         }
     }
 }
@@ -136,10 +139,9 @@ pub fn parse_rower_fragment(input: &[u8]) -> PResult<'_, RowerFragment> {
         let (i, flags) = context("flags", le_u16).parse(i)?;
         let more = bit(flags, 0);
 
-        let (i, sr_raw) = context("stroke_rate_half_spm", parse_u8).parse(i)?;
-        let (i, sc_raw) = context("stroke_count", le_u16).parse(i)?;
-        let stroke_rate_half_spm = if more { None } else { Some(sr_raw) };
-        let stroke_count = if more { None } else { Some(sc_raw) };
+        let (i, stroke_rate_half_spm) =
+            cond(!more, context("stroke_rate_half_spm", parse_u8)).parse(i)?;
+        let (i, stroke_count) = cond(!more, context("stroke_count", le_u16)).parse(i)?;
 
         let (i, avg_stroke_rate_half_spm) = cond(bit(flags, 1), parse_u8).parse(i)?;
         let (i, total_distance_m) = cond(bit(flags, 2), |i| {
@@ -173,6 +175,8 @@ pub fn parse_rower_fragment(input: &[u8]) -> PResult<'_, RowerFragment> {
             ),
             None => (None, None, None),
         };
+
+        let (i, _) = take_while(|b| b == 0u8)(i)?;
 
         let fragment = RowerFragment {
             flags,
@@ -256,11 +260,9 @@ mod tests {
 
     #[test]
     fn parses_intermediate_fragment_without_base_fields() {
-        // MoreData = 1, Average Power present (bit 6)
-        let bytes: [u8; 7] = [
+        // MoreData = 1, Average Power present (bit 6) -> no SR/SC bytes
+        let bytes: [u8; 4] = [
             0x41, 0x00, // flags (MoreData=1, bit6 set)
-            0x00, // stroke rate placeholder (should be ignored)
-            0x00, 0x00, // stroke count placeholder (ignored)
             0x96, 0x00, // avg power = 150 W
         ];
 
@@ -373,11 +375,13 @@ mod prop_tests {
 
         let mut bytes = vec![(flags & 0x00FF) as u8, (flags >> 8) as u8];
 
-        bytes.push(sr_half);
-        bytes.extend_from_slice(&stroke_count.to_le_bytes());
-
-        let stroke_rate_half_spm = if more_data { None } else { Some(sr_half) };
-        let stroke_count_opt = if more_data { None } else { Some(stroke_count) };
+        let (stroke_rate_half_spm, stroke_count_opt) = if more_data {
+            (None, None)
+        } else {
+            bytes.push(sr_half);
+            bytes.extend_from_slice(&stroke_count.to_le_bytes());
+            (Some(sr_half), Some(stroke_count))
+        };
 
         let mut avg_spm_opt = None;
         if f_avg_spm {
