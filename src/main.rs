@@ -3,9 +3,12 @@ mod rower_nom;
 use std::{fmt::Write as FmtWrite, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use bpaf::{OptionParser, Parser, construct, long};
+use bpaf::{OptionParser, Parser, construct, long, pure};
 use btleplug::{
-    api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanFilter, WriteType},
+    api::{
+        Central, CharPropFlags, Characteristic, Manager as _, Peripheral as _, ScanFilter,
+        WriteType,
+    },
     platform::{Adapter, Manager, Peripheral},
 };
 use futures::StreamExt;
@@ -19,58 +22,30 @@ const CTRL_POINT_CH: Uuid = Uuid::from_u128(0x0000_2AD9_0000_1000_8000_0080_5F9B
 const STATUS_CH: Uuid = Uuid::from_u128(0x0000_2ADA_0000_1000_8000_0080_5F9B_34FB);
 
 #[derive(Debug, Clone)]
-struct ListOptions {
-    name_contains: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct StreamOptions {
-    handshake: bool,
-    name_contains: Option<String>,
-}
-
-#[derive(Debug, Clone)]
 enum Command {
-    List(ListOptions),
-    Stream(StreamOptions),
+    List,
+    Stream { handshake: bool },
 }
 
-fn list_args() -> impl Parser<ListOptions> {
-    let name_contains = long("name-contains")
-        .help("Filter target peripherals by case-sensitive substring match on the name")
-        .argument::<String>("SUBSTRING")
-        .optional();
-    construct!(ListOptions { name_contains })
-}
-
-fn stream_args() -> impl Parser<StreamOptions> {
-    let handshake = long("handshake")
-        .help("Issue FTMS Request Control and Start/Resume before listening")
-        .switch();
-    let name_contains = long("name-contains")
-        .help("Filter target peripherals by case-sensitive substring match on the name")
-        .argument::<String>("SUBSTRING")
-        .optional();
-    construct!(StreamOptions {
-        handshake,
-        name_contains
-    })
-}
-
-fn cli() -> OptionParser<Command> {
-    let list = list_args()
+fn list_command() -> impl Parser<Command> {
+    pure(Command::List)
         .to_options()
         .descr("Scan, connect, and print all advertised services and characteristics")
         .command("list")
-        .map(Command::List);
+}
 
-    let stream = stream_args()
+fn stream_command() -> impl Parser<Command> {
+    let handshake = long("handshake")
+        .help("Issue FTMS Request Control and Start/Resume before listening")
+        .switch();
+    construct!(Command::Stream { handshake })
         .to_options()
         .descr("Subscribe to the FTMS Rower Data characteristic")
         .command("stream")
-        .map(Command::Stream);
+}
 
-    construct!([list, stream])
+fn cli() -> OptionParser<Command> {
+    construct!([list_command(), stream_command()])
         .to_options()
         .descr("MERACH/FTMS probe in Rust")
         .version(env!("CARGO_PKG_VERSION"))
@@ -85,27 +60,18 @@ async fn main() -> Result<()> {
 
     let cmd = cli().run();
 
-    let manager = Manager::new()
-        .await
-        .context("Bluetooth adapter manager initialisation failed")?;
-    let adapters = manager.adapters().await?;
-    let Some(adapter) = adapters.into_iter().next() else {
-        bail!("No Bluetooth adapters found");
-    };
+    let adapter = init_adapter().await?;
 
     match cmd {
-        Command::List(opts) => list_gatt(&adapter, opts.name_contains.as_deref()).await?,
-        Command::Stream(opts) => {
-            stream_rower(&adapter, opts.name_contains.as_deref(), opts.handshake).await?
-        }
+        Command::List => list_gatt(&adapter).await?,
+        Command::Stream { handshake } => stream_rower(&adapter, handshake).await?,
     }
 
     Ok(())
 }
 
-async fn list_gatt(adapter: &Adapter, name_contains: Option<&str>) -> Result<()> {
-    let peripheral = pick_ftms_device(adapter, name_contains).await?;
-    connect_and_discover(&peripheral).await?;
+async fn list_gatt(adapter: &Adapter) -> Result<()> {
+    let peripheral = connect_target(adapter).await?;
 
     if let Some(props) = peripheral.properties().await? {
         println!("Connected to: {:?}", props);
@@ -125,69 +91,29 @@ async fn list_gatt(adapter: &Adapter, name_contains: Option<&str>) -> Result<()>
     Ok(())
 }
 
-async fn stream_rower(
-    adapter: &Adapter,
-    name_contains: Option<&str>,
-    handshake: bool,
-) -> Result<()> {
-    let peripheral = pick_ftms_device(adapter, name_contains).await?;
-    connect_and_discover(&peripheral).await?;
-
-    let mut rower_data = None;
-    let mut ctrl_point = None;
-    let mut status = None;
-
-    for ch in peripheral.characteristics() {
-        if ch.uuid == ROWER_DATA_CH {
-            rower_data = Some(ch.clone());
-        } else if ch.uuid == CTRL_POINT_CH {
-            ctrl_point = Some(ch.clone());
-        } else if ch.uuid == STATUS_CH {
-            status = Some(ch.clone());
-        }
-    }
-
-    let rower = rower_data.context("Rower Data (0x2AD1) characteristic not found")?;
+async fn stream_rower(adapter: &Adapter, handshake: bool) -> Result<()> {
+    let peripheral = connect_target(adapter).await?;
+    let characteristics = find_rower_characteristics(&peripheral)?;
 
     peripheral
-        .subscribe(&rower)
+        .subscribe(&characteristics.data)
         .await
         .context("Failed to subscribe to Rower Data notifications")?;
 
     if handshake {
-        if let Some(cp) = &ctrl_point {
-            peripheral
-                .subscribe(cp)
-                .await
-                .context("Failed to subscribe to Control Point indications")?;
-
-            peripheral
-                .write(cp, &[0x00], WriteType::WithResponse)
-                .await
-                .context("Control Point Request Control (0x00) failed")?;
-            peripheral
-                .write(cp, &[0x07], WriteType::WithResponse)
-                .await
-                .context("Control Point Start/Resume (0x07) failed")?;
-            println!("Sent FTMS Request Control + Start/Resume");
-        } else {
-            println!("Control Point (0x2AD9) missing; skipping handshake");
-        }
-
-        if let Some(status) = &status {
-            let _ = peripheral.subscribe(status).await;
-        }
+        perform_handshake(&peripheral, &characteristics).await?;
     }
 
-    let ctrl_uuid = ctrl_point.as_ref().map(|c| c.uuid);
-    let status_uuid = status.as_ref().map(|c| c.uuid);
+    let ctrl_uuid = characteristics.ctrl_point.as_ref().map(|c| c.uuid);
+    let status_uuid = characteristics.status.as_ref().map(|c| c.uuid);
 
     let mut notifications = peripheral.notifications().await?;
     let mut assembler = rower_nom::RowerAssembler::default();
+    let mut last_record: Option<rower_nom::RowerRecord> = None;
     println!("Waiting for Rower Data notifications...");
 
     while let Some(notification) = notifications.next().await {
-        if notification.uuid == rower.uuid {
+        if notification.uuid == characteristics.data.uuid {
             match rower_nom::parse_rower_fragment(&notification.value) {
                 Ok((remaining, fragment)) => {
                     let flags = fragment.flags;
@@ -197,8 +123,10 @@ async fn stream_rower(
                             hex(remaining)
                         );
                     }
-                    if let Some(record) = assembler.push(fragment) {
+                    if let Some(mut record) = assembler.push(fragment) {
+                        enhance_instant_pace(&mut record, last_record.as_ref());
                         println!("{}", format_rower_record(&record));
+                        last_record = Some(record);
                     }
                 }
                 Err(err) => {
@@ -219,7 +147,59 @@ async fn stream_rower(
     Ok(())
 }
 
-async fn pick_ftms_device(adapter: &Adapter, name_contains: Option<&str>) -> Result<Peripheral> {
+fn enhance_instant_pace(
+    current: &mut rower_nom::RowerRecord,
+    previous: Option<&rower_nom::RowerRecord>,
+) {
+    let ok = current
+        .inst_pace_s_per_500m
+        .map(|pace| pace != 0)
+        .unwrap_or(false);
+    if ok {
+        return;
+    }
+
+    let Some(prev) = previous else {
+        return;
+    };
+
+    let (Some(d2), Some(d1), Some(t2), Some(t1)) = (
+        current.total_distance_m,
+        prev.total_distance_m,
+        current.elapsed_time_s,
+        prev.elapsed_time_s,
+    ) else {
+        return;
+    };
+
+    let dd = d2.saturating_sub(d1);
+    let dt = t2.saturating_sub(t1);
+    if dd == 0 || dt == 0 {
+        return;
+    }
+
+    let pace = (500u32 * dt as u32) / dd as u32;
+    current.inst_pace_s_per_500m = Some(pace as u16);
+}
+
+async fn init_adapter() -> Result<Adapter> {
+    let manager = Manager::new()
+        .await
+        .context("Bluetooth adapter manager initialisation failed")?;
+    let adapters = manager.adapters().await?;
+    adapters
+        .into_iter()
+        .next()
+        .context("No Bluetooth adapters found")
+}
+
+async fn connect_target(adapter: &Adapter) -> Result<Peripheral> {
+    let peripheral = pick_ftms_device(adapter).await?;
+    connect_and_discover(&peripheral).await?;
+    Ok(peripheral)
+}
+
+async fn pick_ftms_device(adapter: &Adapter) -> Result<Peripheral> {
     adapter
         .start_scan(ScanFilter::default())
         .await
@@ -227,31 +207,17 @@ async fn pick_ftms_device(adapter: &Adapter, name_contains: Option<&str>) -> Res
     // Give the adapter a moment to populate devices.
     time::sleep(Duration::from_secs(3)).await;
 
-    let mut candidates = Vec::new();
     for peripheral in adapter.peripherals().await? {
         let Some(props) = peripheral.properties().await? else {
             continue;
         };
 
-        let name = props.local_name.unwrap_or_default();
-        let name_ok = name_contains
-            .map(|needle| name.contains(needle))
-            .unwrap_or(true);
-        let svc_present = props.services.contains(&FTMS_SVC);
-        let include = match name_contains {
-            Some(_) => name_ok && (svc_present || props.services.is_empty()),
-            None => name_ok && svc_present,
-        };
-
-        if include {
-            candidates.push(peripheral);
+        if props.services.contains(&FTMS_SVC) {
+            return Ok(peripheral);
         }
     }
 
-    candidates
-        .into_iter()
-        .next()
-        .context("No FTMS-like device found (try --name-contains or wake the console)")
+    bail!("No FTMS-like device found (make sure the console is awake)");
 }
 
 async fn connect_and_discover(peripheral: &Peripheral) -> Result<()> {
@@ -269,24 +235,83 @@ async fn connect_and_discover(peripheral: &Peripheral) -> Result<()> {
     Ok(())
 }
 
+struct RowerCharacteristics {
+    data: Characteristic,
+    ctrl_point: Option<Characteristic>,
+    status: Option<Characteristic>,
+}
+
+fn find_rower_characteristics(peripheral: &Peripheral) -> Result<RowerCharacteristics> {
+    let mut data = None;
+    let mut ctrl_point = None;
+    let mut status = None;
+
+    for ch in peripheral.characteristics() {
+        if ch.uuid == ROWER_DATA_CH {
+            data = Some(ch.clone());
+        } else if ch.uuid == CTRL_POINT_CH {
+            ctrl_point = Some(ch.clone());
+        } else if ch.uuid == STATUS_CH {
+            status = Some(ch.clone());
+        }
+    }
+
+    let data = data.context("Rower Data (0x2AD1) characteristic not found")?;
+    Ok(RowerCharacteristics {
+        data,
+        ctrl_point,
+        status,
+    })
+}
+
+async fn perform_handshake(peripheral: &Peripheral, chars: &RowerCharacteristics) -> Result<()> {
+    if let Some(ctrl) = &chars.ctrl_point {
+        peripheral
+            .subscribe(ctrl)
+            .await
+            .context("Failed to subscribe to Control Point indications")?;
+
+        peripheral
+            .write(ctrl, &[0x00], WriteType::WithResponse)
+            .await
+            .context("Control Point Request Control (0x00) failed")?;
+        peripheral
+            .write(ctrl, &[0x07], WriteType::WithResponse)
+            .await
+            .context("Control Point Start/Resume (0x07) failed")?;
+        println!("Sent FTMS Request Control + Start/Resume");
+    } else {
+        println!("Control Point (0x2AD9) missing; skipping handshake");
+    }
+
+    if let Some(status) = &chars.status {
+        let _ = peripheral.subscribe(status).await;
+    }
+
+    Ok(())
+}
+
 fn fmt_props(props: CharPropFlags) -> String {
+    let labels = [
+        (CharPropFlags::READ, "READ"),
+        (CharPropFlags::WRITE, "WRITE"),
+        (CharPropFlags::WRITE_WITHOUT_RESPONSE, "WRITE_NR"),
+        (CharPropFlags::NOTIFY, "NOTIFY"),
+        (CharPropFlags::INDICATE, "INDICATE"),
+    ];
+
+    let mut first = true;
     let mut s = String::new();
-    if props.contains(CharPropFlags::READ) {
-        let _ = write!(s, "READ ");
+    for (flag, label) in labels {
+        if props.contains(flag) {
+            if !first {
+                s.push(' ');
+            }
+            first = false;
+            s.push_str(label);
+        }
     }
-    if props.contains(CharPropFlags::WRITE) {
-        let _ = write!(s, "WRITE ");
-    }
-    if props.contains(CharPropFlags::WRITE_WITHOUT_RESPONSE) {
-        let _ = write!(s, "WRITE_NR ");
-    }
-    if props.contains(CharPropFlags::NOTIFY) {
-        let _ = write!(s, "NOTIFY ");
-    }
-    if props.contains(CharPropFlags::INDICATE) {
-        let _ = write!(s, "INDICATE ");
-    }
-    s.trim_end().to_owned()
+    s
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -324,6 +349,9 @@ fn format_rower_record(record: &rower_nom::RowerRecord) -> String {
     if let Some(avg_power) = record.avg_power_w {
         parts.push(format!("avg_power={}W", avg_power));
     }
+    if let Some(res) = record.resistance_level {
+        parts.push(format!("res={}", res));
+    }
     if let Some(hr) = record.heart_rate_bpm {
         parts.push(format!("hr={}bpm", hr));
     }
@@ -342,10 +370,10 @@ fn format_rower_record(record: &rower_nom::RowerRecord) -> String {
     if let Some(total_energy) = record.total_energy_kcal {
         parts.push(format!("energy={}kcal", total_energy));
     }
-    if let Some(en_hr) = record.energy_per_hour_kcal {
+    if let Some(en_hr) = record.energy_per_hour_kcal.filter(|v| *v != 0) {
         parts.push(format!("energy_hr={}kcal", en_hr));
     }
-    if let Some(en_min) = record.energy_per_minute_kcal {
+    if let Some(en_min) = record.energy_per_minute_kcal.filter(|v| *v != 0) {
         parts.push(format!("energy_min={}kcal", en_min));
     }
     if let Some(elapsed) = record.elapsed_time_s {
