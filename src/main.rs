@@ -1,9 +1,14 @@
+mod rower_nom;
+
+use std::{fmt::Write as FmtWrite, time::Duration};
+
 use anyhow::{Context, Result, bail};
 use bpaf::{OptionParser, Parser, construct, long};
-use btleplug::api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanFilter, WriteType};
-use btleplug::platform::{Adapter, Manager, Peripheral};
+use btleplug::{
+    api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanFilter, WriteType},
+    platform::{Adapter, Manager, Peripheral},
+};
 use futures::StreamExt;
-use std::{fmt::Write as FmtWrite, time::Duration};
 use tokio::time;
 use tracing::Level;
 use uuid::Uuid;
@@ -178,13 +183,31 @@ async fn stream_rower(
     let status_uuid = status.as_ref().map(|c| c.uuid);
 
     let mut notifications = peripheral.notifications().await?;
+    let mut assembler = rower_nom::RowerAssembler::default();
     println!("Waiting for Rower Data notifications...");
 
     while let Some(notification) = notifications.next().await {
         if notification.uuid == rower.uuid {
-            println!("rower 0x2AD1: {}", hex(&notification.value));
-            if let Some((spm, strokes)) = try_parse_minimal_rower(&notification.value) {
-                println!("  spm={} stroke_count={}", spm, strokes);
+            match rower_nom::parse_rower_fragment(&notification.value) {
+                Ok((remaining, fragment)) => {
+                    let flags = fragment.flags;
+                    if !remaining.is_empty() {
+                        eprintln!(
+                            "Trailing bytes after FTMS parse (flags=0x{flags:04X}): {}",
+                            hex(remaining)
+                        );
+                    }
+                    if let Some(record) = assembler.push(fragment) {
+                        println!("{}", format_rower_record(&record));
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Failed to parse FTMS rower data: {:?}; raw={}",
+                        err,
+                        hex(&notification.value)
+                    );
+                }
             }
         } else if Some(notification.uuid) == ctrl_uuid {
             println!("ctrl-point resp: {}", hex(&notification.value));
@@ -214,9 +237,13 @@ async fn pick_ftms_device(adapter: &Adapter, name_contains: Option<&str>) -> Res
         let name_ok = name_contains
             .map(|needle| name.contains(needle))
             .unwrap_or(true);
-        let svc_ok = props.services.iter().any(|svc| *svc == FTMS_SVC);
+        let svc_present = props.services.contains(&FTMS_SVC);
+        let include = match name_contains {
+            Some(_) => name_ok && (svc_present || props.services.is_empty()),
+            None => name_ok && svc_present,
+        };
 
-        if name_ok && svc_ok {
+        if include {
             candidates.push(peripheral);
         }
     }
@@ -273,15 +300,67 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-fn try_parse_minimal_rower(bytes: &[u8]) -> Option<(u16, u16)> {
-    if bytes.len() < 6 {
-        return None;
+fn fmt_pace(seconds: u16) -> String {
+    let minutes = seconds / 60;
+    let secs = seconds % 60;
+    format!("{minutes}:{secs:02}")
+}
+
+fn format_rower_record(record: &rower_nom::RowerRecord) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(spm) = record.stroke_rate_spm() {
+        parts.push(format!("spm={:.1}", spm));
     }
-    let _flags = u16::from_le_bytes([bytes[0], bytes[1]]);
-    let spm = u16::from_le_bytes([bytes[2], bytes[3]]);
-    let strokes = u16::from_le_bytes([bytes[4], bytes[5]]);
-    if spm == 0 || spm > 120 {
-        return None;
+    if let Some(strokes) = record.stroke_count {
+        parts.push(format!("strokes={}", strokes));
     }
-    Some((spm, strokes))
+    if let Some(distance) = record.total_distance_m {
+        parts.push(format!("distance={}m", distance));
+    }
+    if let Some(power) = record.inst_power_w {
+        parts.push(format!("power={}W", power));
+    }
+    if let Some(avg_power) = record.avg_power_w {
+        parts.push(format!("avg_power={}W", avg_power));
+    }
+    if let Some(hr) = record.heart_rate_bpm {
+        parts.push(format!("hr={}bpm", hr));
+    }
+    if let Some(pace) = record.inst_pace_s_per_500m {
+        parts.push(format!("pace={}/500m", fmt_pace(pace)));
+    }
+    if let Some(avg_pace) = record.avg_pace_s_per_500m {
+        parts.push(format!("avg_pace={}/500m", fmt_pace(avg_pace)));
+    }
+    if let Some(avg_spm) = record.avg_stroke_rate_spm() {
+        parts.push(format!("avg_spm={:.1}", avg_spm));
+    }
+    if let Some(met) = record.metabolic_equiv() {
+        parts.push(format!("met={:.1}", met));
+    }
+    if let Some(total_energy) = record.total_energy_kcal {
+        parts.push(format!("energy={}kcal", total_energy));
+    }
+    if let Some(en_hr) = record.energy_per_hour_kcal {
+        parts.push(format!("energy_hr={}kcal", en_hr));
+    }
+    if let Some(en_min) = record.energy_per_minute_kcal {
+        parts.push(format!("energy_min={}kcal", en_min));
+    }
+    if let Some(elapsed) = record.elapsed_time_s {
+        parts.push(format!("elapsed={}s", elapsed));
+    }
+    if let Some(remaining) = record.remaining_time_s {
+        parts.push(format!("remaining={}s", remaining));
+    }
+    if record.flags != 0 {
+        parts.push(format!("flags=0x{:04X}", record.flags));
+    }
+
+    if parts.is_empty() {
+        "rower record (no fields)".to_owned()
+    } else {
+        format!("rower {}", parts.join(" "))
+    }
 }

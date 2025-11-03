@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 214f4ff1b150b66c83a5a51188ab66c6a5ec60397f0ead4f6bb551334c3d3c88 # shrinks to (bytes, expected) = ([1, 0], RowerFragment { flags: 1, more_data: true, stroke_rate_half_spm: None, stroke_count: None, avg_stroke_rate_half_spm: None, total_distance_m: None, inst_pace_s_per_500m: None, avg_pace_s_per_500m: None, inst_power_w: None, avg_power_w: None, resistance_level: None, total_energy_kcal: None, energy_per_hour_kcal: None, energy_per_minute_kcal: None, heart_rate_bpm: None, metabolic_equiv_tenths: None, elapsed_time_s: None, remaining_time_s: None })
+cc bbc8dd6c4bb01c4fae6e045f8d62be4e3bd1fc6c9076128a1b2b82523a09d3e9 # shrinks to (bytes1, bytes2, expected) = ([1, 0], [0, 0, 0, 0, 0], RowerRecord { flags: 1, stroke_rate_half_spm: Some(0), stroke_count: Some(0), avg_stroke_rate_half_spm: None, total_distance_m: None, inst_pace_s_per_500m: None, avg_pace_s_per_500m: None, inst_power_w: None, avg_power_w: None, resistance_level: None, total_energy_kcal: None, energy_per_hour_kcal: None, energy_per_minute_kcal: None, heart_rate_bpm: None, metabolic_equiv_tenths: None, elapsed_time_s: None, remaining_time_s: None })
